@@ -947,9 +947,41 @@ fn group_paragraphs(lines: &[OcrLine]) -> String {
     }
     paras
         .iter()
-        .map(|p| p.iter().map(|l| l.text.as_str()).collect::<String>())
+        .map(|p| join_paragraph(p))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// CJK wraps mid-sentence, so a line break there is glue; English wraps mid-word, so the break
+/// needs a space or the two halves of a word fuse together.
+fn join_paragraph(lines: &[&OcrLine]) -> String {
+    let mut out = String::new();
+    for l in lines {
+        if !glued(out.chars().last(), l.text.chars().next()) {
+            out.push(' ');
+        }
+        out.push_str(&l.text);
+    }
+    out
+}
+
+fn glued(prev: Option<char>, cur: Option<char>) -> bool {
+    prev.is_none_or(|c| c.is_whitespace() || cjk(c)) || cur.is_none_or(cjk)
+}
+
+/// Han, kana, Hangul, CJK punctuation and fullwidth forms.
+fn cjk(c: char) -> bool {
+    let c = c as u32;
+    matches!(
+        c,
+        0x1100..=0x11FF
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x2FA1F
+    )
 }
 
 fn buffer_text(view: &gtk4::TextView) -> String {
@@ -1183,5 +1215,31 @@ mod tests {
             !niri_windows_claim_focus(r#"[{"pid":4242}]"#, 4242),
             "missing is_focused counts as unfocused"
         );
+    }
+
+    fn line(text: &str, y: i32) -> OcrLine {
+        OcrLine {
+            poly: [[10, y], [100, y], [100, y + 20], [10, y + 20]],
+            text: text.to_string(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn wrapped_english_words_get_a_space() {
+        let lines = vec![line("transla", 0), line("te the text", 8)];
+        assert_eq!(group_paragraphs(&lines), "transla te the text");
+    }
+
+    #[test]
+    fn cjk_lines_stay_glued() {
+        let lines = vec![line("こん", 0), line("にちは", 8)];
+        assert_eq!(group_paragraphs(&lines), "こんにちは");
+    }
+
+    #[test]
+    fn paragraphs_split_on_newline() {
+        let lines = vec![line("first para", 0), line("second para", 40)];
+        assert_eq!(group_paragraphs(&lines), "first para\nsecond para");
     }
 }

@@ -13,7 +13,7 @@
 
 use anyhow::Context;
 use gtk4::glib::prelude::*;
-use gtk4::{cairo, gio, glib};
+use gtk4::{gio, glib};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -120,13 +120,10 @@ const MENU_XML: &str = r#"<node>
   </interface>
 </node>"#;
 
-/// same art as IconPixmap, exposed as a named theme icon.
-const ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
-  <rect x="1" y="1" width="46" height="46" rx="11" fill="#2563eb"/>
-  <text x="24" y="34" font-family="sans-serif" font-size="27" font-weight="bold"
-        fill="#ffffff" text-anchor="middle">A</text>
-</svg>
-"##;
+/// app art: the raster pixels drive the tray pixmap, the scalable source drives theme lookups.
+const ICON_PNG: &[u8] = include_bytes!("../assets/kosuzu.png");
+
+const ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
 
 struct Actions {
     on_open: Box<dyn Fn()>,
@@ -175,7 +172,7 @@ impl Tray {
         on_screenshot: impl Fn() + 'static,
         on_quit: impl Fn() + 'static,
     ) -> Option<Tray> {
-        install_icon_svg();
+        install_icons();
         let actions = Actions {
             on_open: Box::new(on_open),
             on_selection: Box::new(on_selection),
@@ -596,75 +593,43 @@ impl SniProps {
     }
 }
 
-/// blue rounded square + white bold A; fontconfig picks a bold face.
+/// rasterize the embedded art to `size`; empty on any failure (the named theme icon covers it).
 fn render_icon(size: i32) -> Vec<u8> {
-    let Ok(mut surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size) else {
+    let Ok(img) = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png) else {
         return Vec::new();
     };
-    let Ok(cr) = cairo::Context::new(&surface) else {
+    let Ok(size) = u32::try_from(size) else {
         return Vec::new();
     };
-    let px = f64::from(size);
-    rounded_rect(&cr, 1.0, 1.0, px - 2.0, px - 2.0, px / 5.0);
-    cr.set_source_rgba(37.0 / 255.0, 99.0 / 255.0, 235.0 / 255.0, 1.0);
-    let _ = cr.fill();
-    cr.select_font_face(
-        "sans-serif",
-        cairo::FontSlant::Normal,
-        cairo::FontWeight::Bold,
+    let img = image::imageops::resize(
+        &img.to_rgba8(),
+        size,
+        size,
+        image::imageops::FilterType::Triangle,
     );
-    cr.set_font_size(px * 0.62);
-    if let Ok(ext) = cr.text_extents("A") {
-        // center the glyph
-        cr.move_to(
-            px / 2.0 - ext.x_bearing() - ext.width() / 2.0,
-            px / 2.0 - ext.y_bearing() - ext.height() / 2.0,
-        );
-        let _ = cr.show_text("A");
-    }
-    drop(cr);
-    let Ok(data) = surface.data() else {
-        return Vec::new();
-    };
-    // cairo ARGB32 premultiplied little-endian -> SNI wire format: network-order non-premultiplied ARGB
-    let mut out = Vec::with_capacity(data.len());
-    let (quads, _) = data.as_chunks::<4>();
-    for &[b, g, r, a] in quads {
-        let un = |c: u8| {
-            if a == 0 {
-                0
-            } else {
-                ((u32::from(c) * 255) / u32::from(a)).min(255) as u8
+    // image crate: RGBA rows top-down -> SNI wire format: network-order non-premultiplied ARGB
+    img.pixels()
+        .flat_map(|p| [p.0[3], p.0[0], p.0[1], p.0[2]])
+        .collect()
+}
+
+/// hicolor icons, installed under both the theme name and the app id: the compositor matches
+/// either one. Written every start: a stale icon from an earlier version must not survive.
+fn install_icons() {
+    let hicolor = data_dir().join("icons/hicolor");
+    for name in ["kosuzu", "dev.kosuzu.Kosuzu"] {
+        for (dir, ext, bytes) in [
+            ("scalable/apps", "svg", ICON_SVG),
+            ("256x256/apps", "png", ICON_PNG),
+        ] {
+            let dst = hicolor.join(dir).join(format!("{name}.{ext}"));
+            // a write failure is harmless: IconPixmap still works
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
-        };
-        out.extend_from_slice(&[a, un(r), un(g), un(b)]);
+            let _ = std::fs::write(dst, bytes);
+        }
     }
-    out
-}
-
-fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    use std::f64::consts::{FRAC_PI_2, PI};
-    cr.move_to(x + r, y);
-    cr.line_to(x + w - r, y);
-    cr.arc(x + w - r, y + r, r, -FRAC_PI_2, 0.0);
-    cr.line_to(x + w, y + h - r);
-    cr.arc(x + w - r, y + h - r, r, 0.0, FRAC_PI_2);
-    cr.line_to(x + r, y + h);
-    cr.arc(x + r, y + h - r, r, FRAC_PI_2, PI);
-    cr.line_to(x, y + r);
-    cr.arc(x + r, y + r, r, PI, 3.0 * PI / 2.0);
-    cr.close_path();
-}
-
-fn install_icon_svg() {
-    let dir = data_dir().join("icons/hicolor/scalable/apps");
-    let dst = dir.join("kosuzu.svg");
-    if dst.exists() {
-        return;
-    }
-    // a write failure is harmless: IconPixmap still works
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(&dst, ICON_SVG);
 }
 
 fn debug(msg: impl std::fmt::Display) {
@@ -736,12 +701,11 @@ mod tests {
     fn icon_pixmap_wire_format() {
         let data = render_icon(48);
         assert_eq!(data.len(), 48 * 48 * 4);
-        // not fully transparent: the blue background is drawn
-        let corner = &data[0..4];
-        assert_eq!(corner[0], 0, "corners should be transparent");
+        // the art fills the canvas; the corner stays mostly transparent (downscale bleeds a little)
+        assert!(data[0] < 128, "corner should be mostly transparent");
         let center = &data[((24 * 48 + 24) * 4)..][..4];
         assert_eq!(center[0], 255, "center should be opaque");
-        // non-premultiplied: R <= A
-        assert!(center[1] <= center[0]);
+        // network-order A,R,G,B: the art is copper/orange, so R is the largest channel
+        assert!(center[1] > center[2] && center[2] > center[3]);
     }
 }
