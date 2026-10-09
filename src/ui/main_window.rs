@@ -658,24 +658,40 @@ impl MainWindow {
     }
 
     fn on_swap_langs(&self) {
+        // unreachable with an auto source: the button is disabled, see sync_source_buttons
         let (src, tgt) = self.selected_langs();
-        if src == "auto" {
-            return;
-        }
         self.s.w.source_lang.set_code(&tgt, LANGUAGES);
         self.s.w.target_lang.set_code(&src, LANGUAGES);
     }
 
     fn on_lang_changed(&self) {
         let (src, tgt) = self.selected_langs();
-        let auto = src == "auto";
-        let mut cfg = self.s.config.borrow_mut();
-        cfg.source_lang = src;
-        cfg.target_lang = tgt;
-        cfg.save();
-        // the tts endpoint has no auto-detect, so reading the source aloud
-        // only makes sense once a language is picked
-        self.s.w.btn_speak_src.set_sensitive(!auto);
+        {
+            let mut cfg = self.s.config.borrow_mut();
+            cfg.source_lang = src;
+            cfg.target_lang = tgt;
+            cfg.save();
+        }
+        // auto source: swapping has nothing to swap, and reading aloud has no
+        // language to speak (the tts endpoint rejects it)
+        self.sync_source_buttons();
+    }
+
+    /// the source card's buttons follow the input's emptiness and the source
+    /// language; called on every source-side change
+    fn sync_source_buttons(&self) {
+        let empty = self.source_text().trim().is_empty();
+        let auto = self.selected_langs().0 == "auto";
+        self.s.w.btn_clear.set_sensitive(!empty);
+        self.s.w.btn_speak_src.set_sensitive(!empty && !auto);
+        self.s.w.btn_swap.set_sensitive(!auto);
+    }
+
+    /// the result card's buttons follow the translation's emptiness
+    fn sync_result_buttons(&self) {
+        let empty = self.result_text().trim().is_empty();
+        self.s.w.btn_copy.set_sensitive(!empty);
+        self.s.w.btn_speak_res.set_sensitive(!empty);
     }
 
     fn on_lock_toggled(&self, btn: &gtk4::ToggleButton) {
@@ -856,9 +872,9 @@ impl MainWindow {
         self.s.w.btn_lock.set_active(self.s.locked.get());
         let cfg = self.s.config.borrow();
         self.s.w.footer.set_visible(cfg.show_status_bar);
-        self.s.w
-            .btn_speak_src
-            .set_sensitive(self.s.w.source_lang.code() != "auto");
+        drop(cfg);
+        self.sync_source_buttons();
+        self.sync_result_buttons();
         self.rebuild_llm();
     }
 
@@ -985,12 +1001,18 @@ impl MainWindow {
         self.s.w
             .source_view
             .buffer()
-            .connect_changed(move |_| this.stop_speaking());
+            .connect_changed(move |_| {
+                this.stop_speaking();
+                this.sync_source_buttons();
+            });
         let this = self.clone();
         self.s.w
             .result_view
             .buffer()
-            .connect_changed(move |_| this.stop_speaking());
+            .connect_changed(move |_| {
+                this.stop_speaking();
+                this.sync_result_buttons();
+            });
         let this = self.clone();
         self.s.w.btn_expand.connect_clicked(move |_| this.set_popup_mode(false));
         let this = self.clone();
