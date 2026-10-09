@@ -9,6 +9,7 @@ use crate::config::Config;
 use kosuzu_ocr::{ensure_preset, is_downloaded, models_dir, normalize_preset, OcrEngine, OcrLine};
 use crate::screenshot::{self, ScreenshotError, ScreenshotResult};
 use crate::translate::GoogleTranslator;
+use crate::tts;
 use crate::ui::{crop_window, lang_picker::LangPicker, settings};
 use crate::worker::run_in_worker;
 use gtk4::{gdk, gio, glib};
@@ -188,6 +189,8 @@ struct W {
     btn_translate: gtk4::Button,
     btn_screenshot: gtk4::Button,
     btn_copy: gtk4::Button,
+    btn_speak_src: gtk4::Button,
+    btn_speak_res: gtk4::Button,
     btn_expand: gtk4::Button,
     btn_lock: gtk4::ToggleButton,
     status: gtk4::Label,
@@ -209,6 +212,10 @@ struct S {
     translator: Arc<Mutex<GoogleTranslator>>,
     /// lazy-loaded OCR engine, reused across invocations
     engine: Arc<Mutex<Option<(String, OcrEngine)>>>,
+    /// the playback session while something is being read aloud
+    speaker: RefCell<Option<tts::Speaker>>,
+    /// the button that started it, to restore its icon when it ends
+    speak_btn: RefCell<Option<gtk4::Button>>,
     w: W,
 }
 
@@ -240,6 +247,8 @@ impl MainWindow {
                 screenshot_was_visible: Cell::new(false),
                 translator: Arc::new(Mutex::new(GoogleTranslator::new(Duration::from_secs(15)))),
                 engine: Arc::new(Mutex::new(None)),
+                speaker: RefCell::new(None),
+                speak_btn: RefCell::new(None),
                 w,
             }),
         };
@@ -548,6 +557,52 @@ impl MainWindow {
         self.set_status("Translation copied");
     }
 
+    fn on_speak_source(&self) {
+        let (lang, _) = self.selected_langs();
+        let text = self.source_text();
+        self.speak(&self.s.w.btn_speak_src, &text, &lang);
+    }
+
+    fn on_speak_result(&self) {
+        let (_, lang) = self.selected_langs();
+        let text = self.result_text();
+        self.speak(&self.s.w.btn_speak_res, &text, &lang);
+    }
+
+    /// clicking the playing button stops it; clicking the other one switches over
+    fn speak(&self, btn: &gtk4::Button, text: &str, lang: &str) {
+        if btn.icon_name().as_deref() == Some(tts::STOP_ICON) {
+            self.stop_speaking();
+            return;
+        }
+        self.stop_speaking();
+        let this = self.clone();
+        let btn = btn.clone();
+        match tts::Speaker::start(text, lang, move |error| {
+            this.stop_speaking();
+            if let Some(error) = error {
+                this.set_status(&format!("Speech failed: {error}"));
+            }
+        }) {
+            Ok(speaker) => {
+                *self.s.speaker.borrow_mut() = Some(speaker);
+                *self.s.speak_btn.borrow_mut() = Some(btn.clone());
+                btn.set_icon_name(tts::STOP_ICON);
+                btn.set_tooltip_text(Some("Stop reading"));
+            }
+            Err(e) => self.set_status(&format!("Speech failed: {e}")),
+        }
+    }
+
+    fn stop_speaking(&self) {
+        // dropping the session silences the output mid-word
+        *self.s.speaker.borrow_mut() = None;
+        if let Some(btn) = self.s.speak_btn.borrow_mut().take() {
+            btn.set_icon_name(tts::SPEAK_ICON);
+            btn.set_tooltip_text(Some("Read aloud"));
+        }
+    }
+
     fn on_swap_langs(&self) {
         let (src, tgt) = self.selected_langs();
         if src == "auto" {
@@ -559,10 +614,14 @@ impl MainWindow {
 
     fn on_lang_changed(&self) {
         let (src, tgt) = self.selected_langs();
+        let auto = src == "auto";
         let mut cfg = self.s.config.borrow_mut();
         cfg.source_lang = src;
         cfg.target_lang = tgt;
         cfg.save();
+        // the tts endpoint has no auto-detect, so reading the source aloud
+        // only makes sense once a language is picked
+        self.s.w.btn_speak_src.set_sensitive(!auto);
     }
 
     fn on_lock_toggled(&self, btn: &gtk4::ToggleButton) {
@@ -737,6 +796,9 @@ impl MainWindow {
         self.s.w.btn_lock.set_active(self.s.locked.get());
         let cfg = self.s.config.borrow();
         self.s.w.footer.set_visible(cfg.show_status_bar);
+        self.s.w
+            .btn_speak_src
+            .set_sensitive(self.s.w.source_lang.code() != "auto");
     }
 
     pub(crate) fn sync_status_bar(&self) {
@@ -840,6 +902,25 @@ impl MainWindow {
         self.s.w.btn_screenshot.connect_clicked(move |_| this.start_screenshot());
         let this = self.clone();
         self.s.w.btn_copy.connect_clicked(move |_| this.on_copy_result());
+        let this = self.clone();
+        self.s.w
+            .btn_speak_src
+            .connect_clicked(move |_| this.on_speak_source());
+        let this = self.clone();
+        self.s.w
+            .btn_speak_res
+            .connect_clicked(move |_| this.on_speak_result());
+        // any edit invalidates what is being read aloud
+        let this = self.clone();
+        self.s.w
+            .source_view
+            .buffer()
+            .connect_changed(move |_| this.stop_speaking());
+        let this = self.clone();
+        self.s.w
+            .result_view
+            .buffer()
+            .connect_changed(move |_| this.stop_speaking());
         let this = self.clone();
         self.s.w.btn_expand.connect_clicked(move |_| this.set_popup_mode(false));
         let this = self.clone();
@@ -1029,6 +1110,12 @@ fn build_ui() -> (W, gtk4::Box) {
     let btn_copy = gtk4::Button::from_icon_name("edit-copy-symbolic");
     btn_copy.add_css_class("flat");
     btn_copy.set_tooltip_text(Some("Copy translation"));
+    let btn_speak_src = gtk4::Button::from_icon_name(tts::SPEAK_ICON);
+    btn_speak_src.add_css_class("flat");
+    btn_speak_src.set_tooltip_text(Some("Read aloud"));
+    let btn_speak_res = gtk4::Button::from_icon_name(tts::SPEAK_ICON);
+    btn_speak_res.add_css_class("flat");
+    btn_speak_res.set_tooltip_text(Some("Read aloud"));
     let btn_expand = gtk4::Button::from_icon_name("view-fullscreen-symbolic");
     btn_expand.set_tooltip_text(Some("Switch to the full editor"));
     btn_expand.set_visible(false);
@@ -1128,6 +1215,7 @@ fn build_ui() -> (W, gtk4::Box) {
     row_text.set_margin_bottom(8);
     row_text.append(&btn_screenshot);
     row_text.append(&btn_clear);
+    row_text.append(&btn_speak_src);
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     row_text.append(&spacer);
@@ -1158,6 +1246,7 @@ fn build_ui() -> (W, gtk4::Box) {
     res_spacer.set_hexpand(true);
     res_row.append(&res_spacer);
     res_row.append(&btn_copy);
+    res_row.append(&btn_speak_res);
     let res_col = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     res_col.append(&scroll_res);
     res_col.append(&res_row);
@@ -1201,6 +1290,8 @@ fn build_ui() -> (W, gtk4::Box) {
         btn_translate,
         btn_screenshot,
         btn_copy,
+        btn_speak_src,
+        btn_speak_res,
         btn_expand,
         btn_lock,
         status,

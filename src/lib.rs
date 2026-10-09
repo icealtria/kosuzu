@@ -10,5 +10,6 @@ pub mod config;
 pub mod screenshot;
 pub mod translate;
 pub mod tray;
+pub mod tts;
 pub mod ui;
 pub mod worker;
