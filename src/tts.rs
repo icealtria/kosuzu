@@ -49,6 +49,9 @@ struct Inner {
 /// One playback session. Dropping it stops the output mid-word.
 pub struct Speaker {
     player: gst::Element,
+    /// the only strong reference: dropped together with the session, which makes
+    /// the bus watch's Weak upgrade fail and ends the queue; never read directly
+    #[allow(dead_code)]
     inner: Rc<RefCell<Inner>>,
     /// ends the bus watch when the session is dropped; never read on purpose
     #[allow(dead_code)]
