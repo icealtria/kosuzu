@@ -7,6 +7,7 @@ pub mod app;
 pub mod args;
 pub mod clipboard;
 pub mod config;
+pub mod llm;
 pub mod screenshot;
 pub mod translate;
 pub mod tray;

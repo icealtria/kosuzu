@@ -17,6 +17,12 @@ pub struct Config {
     /// auto | grim | niri | portal
     pub screenshot_backend: String,
     pub auto_translate_after_ocr: bool,
+    /// google | llm
+    pub translate_engine: String,
+    /// any OpenAI-compatible endpoint root: an API provider, or a local server
+    pub llm_base_url: String,
+    pub llm_model: String,
+    pub llm_api_key: String,
     /// pinned: keep the popup visible even when unfocused
     pub popup_lock: bool,
     pub show_status_bar: bool,
@@ -30,6 +36,10 @@ impl Default for Config {
             ocr_model: "small".into(),
             screenshot_backend: "auto".into(),
             auto_translate_after_ocr: true,
+            translate_engine: "google".into(),
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            llm_api_key: String::new(),
             popup_lock: false,
             show_status_bar: true,
         }
@@ -90,6 +100,10 @@ impl Config {
             ocr_model,
             screenshot_backend,
             auto_translate_after_ocr,
+            translate_engine,
+            llm_base_url,
+            llm_model,
+            llm_api_key,
             popup_lock,
             show_status_bar,
         );
@@ -109,7 +123,15 @@ impl Config {
                 return;
             }
         }
-        let _ = std::fs::write(path, json);
+        if std::fs::write(path, json).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        // the api key sits in plain text; keep the file to the owner
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 
@@ -179,5 +201,18 @@ mod tests {
         // save failures must stay silent
         let cfg = Config::default();
         cfg.save_to(std::path::Path::new("/nonexistent-dir/kosuzu/cfg.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only_it_holds_the_api_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp("perm.json");
+        let mut cfg = Config::default();
+        cfg.llm_api_key = "sk-secret".into();
+        cfg.save_to(&p);
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "api key must not be world-readable");
+        let _ = std::fs::remove_file(&p);
     }
 }

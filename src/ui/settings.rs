@@ -2,6 +2,8 @@
 //! AdwPreferencesDialog with pages/groups/rows, opened over the main window.
 
 use crate::config::Config;
+use crate::llm::{self, LlmTranslator};
+use gtk4::glib;
 use kosuzu_ocr::models_dir;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
@@ -69,6 +71,53 @@ pub(crate) fn open(
     ocr_group.add(&folder_row);
     page.add(&ocr_group);
 
+    let parent = parent.clone();
+
+    // ---- Providers ----
+    let providers = libadwaita::PreferencesGroup::new();
+    providers.set_title("Providers");
+
+    let engine_row = libadwaita::ComboRow::builder()
+        .title("Translator")
+        .subtitle("Choose from the available translation services.")
+        .build();
+    let engines =
+        gtk4::StringList::new(&["Google", "OpenAI-compatible"]);
+    engine_row.set_model(Some(&engines));
+    {
+        let cfg = config.borrow();
+        engine_row.set_selected(if cfg.translate_engine == "llm" { 1 } else { 0 });
+    }
+    // the gear opens the selected provider's config; google has none
+    let gear = gtk4::Button::from_icon_name("emblem-system-symbolic");
+    gear.add_css_class("flat");
+    gear.set_valign(gtk4::Align::Center);
+    gear.set_tooltip_text(Some("Configure this provider"));
+    gear.set_sensitive(config.borrow().translate_engine == "llm");
+    {
+        let gear_parent = parent.clone();
+        let cfg2 = config.clone();
+        let on_ch = on_changed.clone();
+        gear.connect_clicked(move |_| {
+            open_llm_settings(&gear_parent, cfg2.clone(), on_ch.clone());
+        });
+    }
+    {
+        let cfg2 = config.clone();
+        let on_ch = on_changed.clone();
+        let gear2 = gear.clone();
+        engine_row.connect_selected_notify(move |row| {
+            let engine = if row.selected() == 1 { "llm" } else { "google" };
+            cfg2.borrow_mut().translate_engine = engine.into();
+            cfg2.borrow().save();
+            gear2.set_sensitive(engine == "llm");
+            on_ch();
+        });
+    }
+    engine_row.add_suffix(&gear);
+    providers.add(&engine_row);
+    page.add(&providers);
+
     // ---- Behavior ----
     let behavior = libadwaita::PreferencesGroup::new();
     behavior.set_title("Behavior");
@@ -125,6 +174,137 @@ pub(crate) fn open(
     behavior.add(&status_row);
     page.add(&behavior);
 
+    dialog.add(&page);
+    dialog.present(Some(&parent));
+}
+
+/// The LLM provider's own page, opened from the Providers gear. Fields write
+/// config as you type, so there is nothing to remember to save.
+fn open_llm_settings(
+    parent: &gtk4::ApplicationWindow,
+    config: Rc<RefCell<Config>>,
+    on_changed: Rc<dyn Fn()>,
+) {
+    let dialog = libadwaita::PreferencesDialog::builder()
+        .title("LLM translation")
+        .build();
+    let page = libadwaita::PreferencesPage::builder().title("Provider").build();
+    let group = libadwaita::PreferencesGroup::new();
+    group.set_title("OpenAI-compatible endpoint");
+    group.set_description(Some(
+        "Any service that speaks /chat/completions: OpenAI, DeepSeek, \
+         OpenRouter, or a local Ollama.",
+    ));
+
+    let base_row = libadwaita::EntryRow::builder().title("Base URL").build();
+    base_row.set_text(&config.borrow().llm_base_url);
+    let model_row = libadwaita::EntryRow::builder().title("Model").build();
+    model_row.set_text(&config.borrow().llm_model);
+    let key_row = libadwaita::PasswordEntryRow::builder()
+        .title("API key")
+        .build();
+    key_row.set_text(&config.borrow().llm_api_key);
+
+    {
+        let cfg = config.clone();
+        let on_ch = on_changed.clone();
+        base_row.connect_changed(move |row| {
+            cfg.borrow_mut().llm_base_url = row.text().to_string();
+            cfg.borrow().save();
+            on_ch();
+        });
+    }
+    {
+        let cfg = config.clone();
+        let on_ch = on_changed.clone();
+        model_row.connect_changed(move |row| {
+            cfg.borrow_mut().llm_model = row.text().to_string();
+            cfg.borrow().save();
+            on_ch();
+        });
+    }
+    {
+        let cfg = config.clone();
+        let on_ch = on_changed.clone();
+        key_row.connect_changed(move |row| {
+            cfg.borrow_mut().llm_api_key = row.text().to_string();
+            cfg.borrow().save();
+            on_ch();
+        });
+    }
+
+    group.add(&base_row);
+    group.add(&model_row);
+    group.add(&key_row);
+
+    let test_row = libadwaita::ActionRow::builder()
+        .title("Test")
+        .subtitle("Send a sample translation with the settings above.")
+        .build();
+    let test_btn = gtk4::Button::with_label("Test");
+    test_btn.add_css_class("flat");
+    test_btn.set_valign(gtk4::Align::Center);
+    test_row.add_suffix(&test_btn);
+    {
+        let cfg = config.clone();
+        let base_row2 = base_row.clone();
+        let model_row2 = model_row.clone();
+        let test_row2 = test_row.clone();
+        let btn2 = test_btn.clone();
+        test_btn.connect_clicked(move |_| {
+            btn2.set_sensitive(false);
+            test_row2.set_subtitle("Testing…");
+            let target = cfg.borrow().target_lang.clone();
+            let (base, model, key) = (
+                base_row2.text().to_string(),
+                model_row2.text().to_string(),
+                key_row.text().to_string(),
+            );
+            let (sender, receiver) = std::sync::mpsc::channel::<(Option<String>, String)>();
+            std::thread::spawn(move || {
+                let now = std::time::Instant::now();
+                let mut sample = String::new();
+                let outcome = LlmTranslator::new(&base, &model, &key).translate(
+                    "Hello, world!",
+                    "en",
+                    &target,
+                    &mut |chunk| sample.push_str(chunk),
+                );
+                // only a passing test tidies the url: a failure could be the key
+                let tidied = match &outcome {
+                    Ok(()) => Some(llm::normalize_base_url(&base))
+                        .filter(|fixed| !fixed.is_empty() && *fixed != base),
+                    Err(_) => None,
+                };
+                let message = match outcome {
+                    Ok(()) => {
+                        format!("OK in {:.1}s: {sample}", now.elapsed().as_secs_f32())
+                    }
+                    Err(e) => format!("Failed: {e}"),
+                };
+                let _ = sender.send((tidied, message));
+            });
+            let base_row3 = base_row.clone();
+            let test_row3 = test_row2.clone();
+            let btn3 = btn2.clone();
+            glib::source::idle_add_local(move || {
+                match receiver.try_recv() {
+                    Ok((tidied, message)) => {
+                        test_row3.set_subtitle(&message);
+                        if let Some(fixed) = tidied {
+                            // connect_changed writes it to config and rebuilds
+                            base_row3.set_text(&fixed);
+                        }
+                        btn3.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                    Err(_) => glib::ControlFlow::Continue,
+                }
+            });
+        });
+    }
+    group.add(&test_row);
+    page.add(&group);
     dialog.add(&page);
     dialog.present(Some(parent));
 }

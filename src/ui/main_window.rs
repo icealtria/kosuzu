@@ -6,6 +6,7 @@
 use crate::clipboard;
 use libadwaita::prelude::*;
 use crate::config::Config;
+use crate::llm::LlmTranslator;
 use kosuzu_ocr::{ensure_preset, is_downloaded, models_dir, normalize_preset, OcrEngine, OcrLine};
 use crate::screenshot::{self, ScreenshotError, ScreenshotResult};
 use crate::translate::GoogleTranslator;
@@ -210,6 +211,8 @@ struct S {
     screenshot_was_visible: Cell<bool>,
     /// one translator session, reused across calls
     translator: Arc<Mutex<GoogleTranslator>>,
+    /// the LLM engine, rebuilt whenever its settings change
+    llm: Arc<Mutex<Option<Arc<LlmTranslator>>>>,
     /// lazy-loaded OCR engine, reused across invocations
     engine: Arc<Mutex<Option<(String, OcrEngine)>>>,
     /// the playback session while something is being read aloud
@@ -246,6 +249,7 @@ impl MainWindow {
                 focus_watch: RefCell::new(None),
                 screenshot_was_visible: Cell::new(false),
                 translator: Arc::new(Mutex::new(GoogleTranslator::new(Duration::from_secs(15)))),
+                llm: Arc::new(Mutex::new(None)),
                 engine: Arc::new(Mutex::new(None)),
                 speaker: RefCell::new(None),
                 speak_btn: RefCell::new(None),
@@ -394,7 +398,10 @@ impl MainWindow {
         }
         let (src, tgt) = self.selected_langs();
         let started = Instant::now();
-        self.set_busy(true, Some("Translating…"));
+        if self.s.config.borrow().translate_engine == "llm" {
+            self.translate_streaming(&text, &src, &tgt, started);
+            return;
+        }
 
         let translator = self.s.translator.clone();
         let this = self.clone();
@@ -420,6 +427,53 @@ impl MainWindow {
                 }
             },
         );
+    }
+
+    /// the LLM engine streams: chunks land in the result view as they arrive.
+    /// The worker thread owns the request; only `Send` messages cross back and
+    /// the main loop drains them into the widgets.
+    fn translate_streaming(&self, text: &str, src: &str, tgt: &str, started: Instant) {
+        self.set_busy(true, Some("Asking the LLM…"));
+        self.set_result_text("");
+        let (sender, receiver) = std::sync::mpsc::channel::<LlmStream>();
+        let llm = self.s.llm.clone();
+        let (text, src, tgt) = (text.to_string(), src.to_string(), tgt.to_string());
+        std::thread::spawn(move || {
+            // clone the engine out of the mutex so the lock never spans the stream
+            let engine = llm.lock().expect("llm mutex poisoned").clone();
+            let outcome = match engine.as_ref() {
+                Some(engine) => engine.translate(&text, &src, &tgt, &mut |chunk| {
+                    let _ = sender.send(LlmStream::Chunk(chunk.to_string()));
+                }),
+                None => Err(anyhow::anyhow!("LLM engine selected but not configured")),
+            };
+            let _ = sender.send(match outcome {
+                Ok(()) => LlmStream::Finished,
+                Err(e) => LlmStream::Failed(e.to_string()),
+            });
+        });
+        // glib 0.20 dropped its channel type, so the main loop drains an mpsc
+        let this = self.clone();
+        glib::source::idle_add_local(move || {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    LlmStream::Chunk(text) => this.append_result_text(&text),
+                    LlmStream::Failed(error) => {
+                        this.set_busy(false, None);
+                        this.set_status(&format!("Translate failed: {error}"));
+                    }
+                    LlmStream::Finished => {
+                        this.set_busy(false, None);
+                        this.set_status(&format!(
+                            "Translated · {:.1}s",
+                            started.elapsed().as_secs_f32()
+                        ));
+                        return glib::ControlFlow::Break;
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     fn cmd_translate_selection(&self, text: Option<String>) {
@@ -779,6 +833,12 @@ impl MainWindow {
         self.s.w.result_view.buffer().set_text(text);
     }
 
+    fn append_result_text(&self, text: &str) {
+        let buf = self.s.w.result_view.buffer();
+        let mut end = buf.end_iter();
+        buf.insert(&mut end, text);
+    }
+
     fn selected_langs(&self) -> (String, String) {
         (self.s.w.source_lang.code(), self.s.w.target_lang.code())
     }
@@ -799,11 +859,21 @@ impl MainWindow {
         self.s.w
             .btn_speak_src
             .set_sensitive(self.s.w.source_lang.code() != "auto");
+        self.rebuild_llm();
     }
 
     pub(crate) fn sync_status_bar(&self) {
         let visible = self.s.config.borrow().show_status_bar;
         self.s.w.footer.set_visible(visible);
+        self.rebuild_llm();
+    }
+
+    /// rebuild the LLM engine from the current settings (no-op for Google)
+    fn rebuild_llm(&self) {
+        let cfg = self.s.config.borrow();
+        let rebuilt = (cfg.translate_engine == "llm" && !cfg.llm_base_url.is_empty())
+            .then(|| Arc::new(LlmTranslator::new(&cfg.llm_base_url, &cfg.llm_model, &cfg.llm_api_key)));
+        *self.s.llm.lock().expect("llm mutex poisoned") = rebuilt;
     }
 
     fn connect_events(&self) {
@@ -1066,6 +1136,13 @@ fn cjk(c: char) -> bool {
             | 0xFF00..=0xFFEF
             | 0x20000..=0x2FA1F
     )
+}
+
+/// worker-thread -> main-loop messages of a streamed translation
+enum LlmStream {
+    Chunk(String),
+    Failed(String),
+    Finished,
 }
 
 fn buffer_text(view: &gtk4::TextView) -> String {
