@@ -788,6 +788,8 @@ impl MainWindow {
                     w.header.set_title_widget(Some(&w.title_label));
                     w.bottom_lang_row.append(&w.lang_row);
                 }
+                // the empty row would still eat the outer box's 8px spacing
+                w.bottom_lang_row.set_visible(!wide);
             }
             glib::ControlFlow::Continue
         });
@@ -1026,10 +1028,10 @@ fn build_ui() -> (W, gtk4::Box) {
 
     let source_view = gtk4::TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(10)
-        .margin_end(10)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
         .build();
     let scroll_src = gtk4::ScrolledWindow::builder()
         .min_content_height(130)
@@ -1040,10 +1042,10 @@ fn build_ui() -> (W, gtk4::Box) {
     let result_view = gtk4::TextView::builder()
         .editable(false)
         .wrap_mode(gtk4::WrapMode::WordChar)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(10)
-        .margin_end(10)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
         .build();
     let scroll_res = gtk4::ScrolledWindow::builder()
         .min_content_height(130)
@@ -1085,11 +1087,13 @@ fn build_ui() -> (W, gtk4::Box) {
     header.pack_start(&btn_expand);
     header.pack_start(&btn_lock);
 
+    // top: 6 here + headerbar's own ~6px bottom padding = 12px of visible gap,
+    // bottom: 12, both matching the 12px side margins
     let outer = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(8)
-        .margin_top(10)
-        .margin_bottom(8)
+        .margin_top(6)
+        .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
         .build();
