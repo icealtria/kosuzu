@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=kosuzu
+Comment=选中文字翻译 + 截图/图片 OCR 翻译
+Exec=kosuzu
+Icon=kosuzu
+Terminal=false
+Categories=Utility;
+StartupWMClass=dev.kosuzu.Kosuzu

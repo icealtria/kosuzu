@@ -1,0 +1,40 @@
+# Maintainer: icealtria <74185220+icealtria@users.noreply.github.com>
+pkgname=kosuzu
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='OCR + Google Translate desktop tool (PP-OCRv6 det/rec, GTK4/libadwaita)'
+arch=('x86_64')
+url='https://github.com/icealtria/kosuzu'
+# no LICENSE file in either repo yet
+license=('unknown')
+# ort loads libonnxruntime.so at runtime (load-dynamic), hence onnxruntime-cpu here and
+# not in makedepends; gtk4/libadwaita are the only linked GUI deps.
+depends=('gtk4' 'libadwaita' 'onnxruntime-cpu')
+makedepends=('cargo' 'git')
+# OCR models are not packaged: they download on first run into ~/.local/share/kosuzu/models
+# (override with KOSUZU_MODELS). rustup users: export RUSTUP_TOOLCHAIN=stable, the code has
+# no nightly features.
+source=(
+  'git+https://github.com/icealtria/kosuzu.git'
+  # kosuzu's Cargo.toml wants ../kosuzu-ocr, so the clones must land side by side in $srcdir
+  'git+https://github.com/icealtria/kosuzu-ocr.git'
+)
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+  cd "$srcdir/kosuzu"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/kosuzu"
+  install -Dm755 target/release/kosuzu "$pkgdir/usr/bin/kosuzu"
+  # file name must match the GApplication id: compositors match windows to a .desktop by id
+  install -Dm644 packaging/arch/kosuzu.desktop \
+    "$pkgdir/usr/share/applications/dev.kosuzu.Kosuzu.desktop"
+  # svg for theme consumers that scale vectors, png for the ones that only read raster (niri)
+  install -Dm644 assets/icon.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/kosuzu.svg"
+  install -Dm644 assets/kosuzu.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/kosuzu.png"
+}

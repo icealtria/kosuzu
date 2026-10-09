@@ -699,13 +699,17 @@ mod tests {
 
     #[test]
     fn icon_pixmap_wire_format() {
-        let data = render_icon(48);
-        assert_eq!(data.len(), 48 * 48 * 4);
-        // the art fills the canvas; the corner stays mostly transparent (downscale bleeds a little)
-        assert!(data[0] < 128, "corner should be mostly transparent");
-        let center = &data[((24 * 48 + 24) * 4)..][..4];
-        assert_eq!(center[0], 255, "center should be opaque");
-        // network-order A,R,G,B: the art is copper/orange, so R is the largest channel
-        assert!(center[1] > center[2] && center[2] > center[3]);
+        // reference: the embedded art decoded straight into the SNI wire order
+        let img = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png)
+            .expect("embedded icon decodes")
+            .to_rgba8();
+        let reference: Vec<u8> = img
+            .pixels()
+            .flat_map(|p| [p.0[3], p.0[0], p.0[1], p.0[2]])
+            .collect();
+        let data = render_icon(img.width() as i32);
+        assert_eq!(data.len(), reference.len());
+        // resizing to the source size must be a no-op; A,R,G,B order is what the host expects
+        assert_eq!(data, reference);
     }
 }
