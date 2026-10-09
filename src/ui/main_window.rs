@@ -861,9 +861,10 @@ impl MainWindow {
                         let this = this.clone();
                         clipboard::read_clipboard_text_async(move |text| {
                             if let Some(text) = text {
-                                let buf = this.s.w.source_view.buffer();
-                                let mut iter = buf.iter_at_mark(&buf.get_insert());
-                                buf.insert(&mut iter, &text);
+                                insert_replacing_selection(
+                                    &this.s.w.source_view.buffer(),
+                                    &text,
+                                );
                             }
                         });
                     }
@@ -989,6 +990,16 @@ fn cjk(c: char) -> bool {
 fn buffer_text(view: &gtk4::TextView) -> String {
     let buf = view.buffer();
     buf.text(&buf.start_iter(), &buf.end_iter(), true).to_string()
+}
+
+/// Clipboard paste, mirroring GTK's own paste: an active selection is replaced
+/// instead of appended to (Ctrl+A leaves the insert mark at the buffer's end).
+fn insert_replacing_selection(buf: &gtk4::TextBuffer, text: &str) {
+    if let Some((mut start, mut end)) = buf.selection_bounds() {
+        buf.delete(&mut start, &mut end);
+    }
+    let mut iter = buf.iter_at_mark(&buf.get_insert());
+    buf.insert(&mut iter, text);
 }
 
 fn build_ui() -> (W, gtk4::Box) {
