@@ -154,6 +154,24 @@ pub(crate) fn open(
     }
     behavior.add(&lock_row);
 
+    let input_row = libadwaita::SwitchRow::builder()
+        .title("Show input in popup")
+        .subtitle("Off: the popup only shows the translation.")
+        .build();
+    input_row.set_active(config.borrow().popup_show_input);
+    {
+        let cfg2 = config.clone();
+        let on_ch = on_changed.clone();
+        input_row.connect_active_notify(move |r| {
+            let mut c = cfg2.borrow_mut();
+            c.popup_show_input = r.is_active();
+            drop(c);
+            cfg2.borrow().save();
+            on_ch();
+        });
+    }
+    behavior.add(&input_row);
+
 
     let status_row = libadwaita::SwitchRow::builder()
         .title("Show status bar")

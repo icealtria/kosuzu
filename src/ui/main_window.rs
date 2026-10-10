@@ -177,6 +177,8 @@ struct W {
     result_view: gtk4::TextView,
     scroll_src: gtk4::ScrolledWindow,
     scroll_res: gtk4::ScrolledWindow,
+    /// the source card as a whole, hidden when the popup runs input-less
+    frame_src: gtk4::Frame,
     row_text: gtk4::Box,
     cards: gtk4::Box,
     header: libadwaita::HeaderBar,
@@ -284,6 +286,7 @@ impl MainWindow {
         }
         self.s.w.btn_expand.set_visible(popup);
         self.s.w.btn_lock.set_visible(popup);
+        self.sync_popup_input();
         self.s.w.scroll_src.set_min_content_height(if popup { 70 } else { 130 });
         self.s.w.scroll_res.set_min_content_height(if popup { 110 } else { 130 });
         let (w, h) = if popup { POPUP_SIZE } else { FULL_SIZE };
@@ -884,6 +887,13 @@ impl MainWindow {
         self.rebuild_llm();
     }
 
+    /// the popup can drop its whole input card, leaving only the translation;
+    /// applies on both mode switches and settings changes
+    fn sync_popup_input(&self) {
+        let show = !self.s.popup_mode.get() || self.s.config.borrow().popup_show_input;
+        self.s.w.frame_src.set_visible(show);
+    }
+
     /// rebuild the LLM engine from the current settings (no-op for Google)
     fn rebuild_llm(&self) {
         let cfg = self.s.config.borrow();
@@ -1062,7 +1072,10 @@ impl MainWindow {
                     this.s.config.clone(),
                     Rc::new({
                         let this = this.clone();
-                        move || this.sync_status_bar()
+                        move || {
+                            this.sync_status_bar();
+                            this.sync_popup_input();
+                        }
                     }) as Rc<dyn Fn()>,
                 );
             });
@@ -1336,7 +1349,6 @@ fn build_ui() -> (W, gtk4::Box) {
     let frame_src = gtk4::Frame::builder().child(&src_col).build();
     frame_src.set_hexpand(true);
     frame_src.set_vexpand(true);
-
     let res_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     res_row.set_margin_start(8);
     res_row.set_margin_end(8);
@@ -1377,6 +1389,7 @@ fn build_ui() -> (W, gtk4::Box) {
         result_view,
         scroll_src,
         scroll_res,
+        frame_src,
         row_text,
         cards,
         header,

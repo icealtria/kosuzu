@@ -25,6 +25,8 @@ pub struct Config {
     pub llm_api_key: String,
     /// pinned: keep the popup visible even when unfocused
     pub popup_lock: bool,
+    /// show the source card in the compact popup (off: translation only)
+    pub popup_show_input: bool,
     pub show_status_bar: bool,
 }
 
@@ -41,6 +43,7 @@ impl Default for Config {
             llm_model: String::new(),
             llm_api_key: String::new(),
             popup_lock: false,
+            popup_show_input: true,
             show_status_bar: true,
         }
     }
@@ -105,6 +108,7 @@ impl Config {
             llm_model,
             llm_api_key,
             popup_lock,
+            popup_show_input,
             show_status_bar,
         );
         cfg
