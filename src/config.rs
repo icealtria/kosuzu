@@ -28,6 +28,8 @@ pub struct Config {
     /// show the source card in the compact popup (off: translation only)
     pub popup_show_input: bool,
     pub show_status_bar: bool,
+    /// show the source-text romanization (Google provider only)
+    pub show_phonetic: bool,
 }
 
 impl Default for Config {
@@ -45,6 +47,7 @@ impl Default for Config {
             popup_lock: false,
             popup_show_input: true,
             show_status_bar: true,
+            show_phonetic: true,
         }
     }
 }
@@ -110,6 +113,7 @@ impl Config {
             popup_lock,
             popup_show_input,
             show_status_bar,
+            show_phonetic,
         );
         cfg
     }
@@ -178,6 +182,7 @@ mod tests {
         assert_eq!(cfg.source_lang, "en"); // type ok -> applies
         assert_eq!(cfg.target_lang, "en"); // wrong type -> default
         assert_eq!(cfg.ocr_model, "small"); // unknown keys do not affect known fields
+        assert!(cfg.show_phonetic); // defaults apply for absent fields
         let _ = std::fs::remove_file(&p);
     }
 

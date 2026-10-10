@@ -17,6 +17,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
 pub struct TranslationResult {
     pub text: String,
     pub detected_source_lang: Option<String>,
+    /// `dt=rm` romanization of the source text; `None` for Latin-script sources
+    pub phonetic: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,9 +123,13 @@ impl GoogleTranslator {
 
         let mut detected: Option<String> = None;
         let mut parts: Vec<String> = Vec::new();
+        let mut phonetic = String::new();
         for chunk in split_text(text, CHUNK_LIMIT) {
-            let (seg, det) = self.request(&chunk, source, target)?;
+            let (seg, det, rm) = self.request(&chunk, source, target)?;
             parts.push(seg);
+            if let Some(rm) = rm {
+                phonetic.push_str(&rm);
+            }
             if detected.is_none() && !det.as_deref().unwrap_or("").is_empty() {
                 detected = det;
             }
@@ -132,6 +138,7 @@ impl GoogleTranslator {
         Ok(TranslationResult {
             text: parts.concat(),
             detected_source_lang: detected,
+            phonetic: (!phonetic.is_empty()).then_some(phonetic),
         })
     }
 
@@ -140,7 +147,7 @@ impl GoogleTranslator {
         query: &str,
         source: &str,
         target: &str,
-    ) -> anyhow::Result<(String, Option<String>)> {
+    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
         // round-robin starting from the last winner
         let mut errors: Vec<String> = Vec::new();
         for i in 0..Strategy::ALL.len() {
@@ -194,7 +201,7 @@ impl GoogleTranslator {
                 })
                 .collect::<String>();
             let detected = list.get(2).and_then(|v| v.as_str()).map(str::to_string);
-            return Ok((text, detected));
+            return Ok((text, detected, parse_phonetic(list)));
         }
 
         Err(anyhow::anyhow!(
@@ -210,26 +217,40 @@ impl GoogleTranslator {
         source: &str,
         target: &str,
     ) -> reqwest::Result<reqwest::blocking::Response> {
-        let common = [
-            ("sl", source),
-            ("tl", target),
-            ("dt", "t"),
-            ("q", query),
-        ];
+        let common = [("sl", source), ("tl", target), ("dt", "t"), ("q", query)];
         match strategy {
             Strategy::PostGtx => {
                 let mut form: Vec<(&str, &str)> = vec![("client", "gtx")];
                 form.extend_from_slice(&common);
+                form.push(("dt", "rm")); // romanization of the source text
                 self.client.post(&self.endpoint).form(&form).send()
             }
             _ => self
                 .client
                 .get(&self.endpoint)
                 .query(&common)
-                .query(&[("client", strategy.client())])
+                .query(&[("client", strategy.client()), ("dt", "rm")])
                 .send(),
         }
     }
+}
+
+/// `dt=rm` romanization of the source text: the segment list carries extra rows
+/// next to the translation segments, with the source romanization at index 3
+/// (index 2 is the translation's own romanization; a Latin-script source has
+/// neither, and such rows are short enough to fall off `len() > 3`).
+fn parse_phonetic(list: &[serde_json::Value]) -> Option<String> {
+    let text: String = list
+        .first()?
+        .as_array()?
+        .iter()
+        .filter_map(|seg| {
+            let row = seg.as_array()?;
+            (row.first()?.is_null() && row.len() > 3)
+                .then(|| row.get(3)?.as_str())?
+        })
+        .collect();
+    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -364,6 +385,13 @@ mod tests {
 
     const OK_JSON: &str = r#"[[["你好","hello",null,null,10]],null,"en"]"#;
 
+    /// live client=gtx shape: ja source, the romanization rides in an extra
+    /// segment row right after the translation segment
+    const PHONETIC_JSON: &str = r#"[[["It's a beautiful view even though you don't think about anything.","何も考えず眺めているのに、ちょうどいい景色ですね。",null,null,3,null,null,[[]],[[["8610ded6ae1f9c19659bfa9bcb7344e7","ja_en_2023q1.md"]]]],[null,null,null,"Nani mo kangaezu nagamete iru no ni, chōdo ī keshikidesu ne."]],null,"ja"]"#;
+
+    /// client=dict-chrome-ex, zh source, translation without romanization
+    const PHONETIC_SEGMENTS_JSON: &str = r#"[[["Hello World","你好世界",null,null,10],[null,null,null,"Nǐ hǎo shìjiè"]],null,"zh-CN"]"#;
+
     #[test]
     fn empty_input_rejected() {
         // empty input returns before any HTTP, no mock needed
@@ -418,6 +446,41 @@ mod tests {
         let err = t.translate("hello", "auto", "zh-CN").unwrap_err();
         assert!(err.to_string().contains("unexpected response shape"));
         assert_eq!(log.lock().unwrap().len(), 3, "broken shape must exhaust all three strategies");
+    }
+
+    #[test]
+    fn phonetic_extracted_from_extra_segment_row() {
+        let (url, log) = spawn_server(|_| (200, PHONETIC_JSON.into()));
+        let mut t = GoogleTranslator::with_endpoint(&url, Duration::from_secs(5));
+        let r = t.translate("何も", "auto", "en").unwrap();
+        assert_eq!(
+            r.phonetic.as_deref(),
+            Some("Nani mo kangaezu nagamete iru no ni, chōdo ī keshikidesu ne.")
+        );
+        assert_eq!(r.text, "It's a beautiful view even though you don't think about anything.");
+        assert_eq!(r.detected_source_lang.as_deref(), Some("ja"));
+        let log = log.lock().unwrap();
+        assert!(
+            log[0].target.contains("dt=rm") || log[0].body.contains("dt=rm"),
+            "dt=rm must be requested"
+        );
+    }
+
+    #[test]
+    fn phonetic_without_target_romanization_reads_the_source_only() {
+        let (url, _) = spawn_server(|_| (200, PHONETIC_SEGMENTS_JSON.into()));
+        let mut t = GoogleTranslator::with_endpoint(&url, Duration::from_secs(5));
+        let r = t.translate("你好世界", "zh-CN", "en").unwrap();
+        assert_eq!(r.text, "Hello World");
+        assert_eq!(r.phonetic.as_deref(), Some("Nǐ hǎo shìjiè"));
+    }
+
+    #[test]
+    fn no_romanization_row_yields_none() {
+        let (url, _) = spawn_server(|_| (200, OK_JSON.into()));
+        let mut t = GoogleTranslator::with_endpoint(&url, Duration::from_secs(5));
+        let r = t.translate("hello", "en", "zh-CN").unwrap();
+        assert_eq!(r.phonetic, None);
     }
 
     #[test]

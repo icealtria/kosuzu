@@ -179,6 +179,9 @@ struct W {
     scroll_res: gtk4::ScrolledWindow,
     /// the source card as a whole, hidden when the popup runs input-less
     frame_src: gtk4::Frame,
+    /// source romanization under the input, plus the button that un-clamps it
+    phonetic: gtk4::Label,
+    phonetic_more: gtk4::Button,
     row_text: gtk4::Box,
     cards: gtk4::Box,
     header: libadwaita::HeaderBar,
@@ -221,6 +224,12 @@ struct S {
     speaker: RefCell<Option<tts::Speaker>>,
     /// the button that started it, to restore its icon when it ends
     speak_btn: RefCell<Option<gtk4::Button>>,
+    /// menu state for the pronunciation toggle; Google-only, gated per engine
+    phonetic_action: gio::SimpleAction,
+    /// romanization of the current source text
+    phonetic: RefCell<String>,
+    /// label width the 3-line clamp was measured at; 0 forces a re-measure
+    phonetic_width: Cell<i32>,
     w: W,
 }
 
@@ -239,10 +248,18 @@ impl MainWindow {
             .default_height(FULL_SIZE.1)
             .build();
         let (w, outer) = build_ui();
+        let config = Config::load();
+        // a stateful boolean action: the menu draws the checkmark, set_enabled
+        // greys the item out for providers without romanization
+        let phonetic_action = gio::SimpleAction::new_stateful(
+            "phonetic",
+            None::<&glib::VariantTy>,
+            &config.show_phonetic.to_variant(),
+        );
         let this = Self {
             win,
             s: Rc::new(S {
-                config: Rc::new(RefCell::new(Config::load())),
+                config: Rc::new(RefCell::new(config)),
                 busy: Cell::new(false),
                 popup_mode: Cell::new(false),
                 hide_when_idle: Cell::new(false),
@@ -255,6 +272,9 @@ impl MainWindow {
                 engine: Arc::new(Mutex::new(None)),
                 speaker: RefCell::new(None),
                 speak_btn: RefCell::new(None),
+                phonetic_action,
+                phonetic: RefCell::new(String::new()),
+                phonetic_width: Cell::new(0),
                 w,
             }),
         };
@@ -420,6 +440,7 @@ impl MainWindow {
                 match result {
                     Ok(r) => {
                         this.set_result_text(&r.text);
+                        this.set_phonetic(r.phonetic.as_deref().unwrap_or_default());
                         let detail = r.detected_source_lang.as_deref().unwrap_or("auto");
                         this.set_status(&format!(
                             "Translated · {detail} · {:.1}s",
@@ -438,6 +459,7 @@ impl MainWindow {
     fn translate_streaming(&self, text: &str, src: &str, tgt: &str, started: Instant) {
         self.set_busy(true, Some("Asking the LLM…"));
         self.set_result_text("");
+        self.set_phonetic(""); // the LLM path has no romanization
         let (sender, receiver) = std::sync::mpsc::channel::<LlmStream>();
         let llm = self.s.llm.clone();
         let (text, src, tgt) = (text.to_string(), src.to_string(), tgt.to_string());
@@ -601,6 +623,7 @@ impl MainWindow {
     fn on_clear(&self) {
         self.s.w.source_view.buffer().set_text("");
         self.s.w.result_view.buffer().set_text("");
+        self.set_phonetic("");
         self.set_status("Cleared");
     }
 
@@ -695,6 +718,42 @@ impl MainWindow {
         let empty = self.result_text().trim().is_empty();
         self.s.w.btn_copy.set_sensitive(!empty);
         self.s.w.btn_speak_res.set_sensitive(!empty);
+    }
+
+    /// the latest source romanization; empty text hides the row entirely
+    fn set_phonetic(&self, text: &str) {
+        self.s.phonetic.replace(text.to_string());
+        // a new text (or width) needs the clamp measured again
+        self.s.phonetic_width.set(0);
+        self.s.w.phonetic.set_text(text);
+        self.s.w.phonetic.set_lines(3);
+        self.s.w.phonetic_more.set_label("More");
+        self.sync_phonetic();
+    }
+
+    /// romanization is a Google-only feature: the menu action and the row both
+    /// follow the engine and the stored config
+    fn sync_phonetic(&self) {
+        let cfg = self.s.config.borrow();
+        let allowed = cfg.translate_engine != "llm";
+        let action = &self.s.phonetic_action;
+        action.set_enabled(allowed);
+        if action.state().and_then(|s| s.get::<bool>()) != Some(cfg.show_phonetic) {
+            action.set_state(&cfg.show_phonetic.to_variant());
+        }
+        let empty = self.s.phonetic.borrow().is_empty();
+        let show = allowed && cfg.show_phonetic && !empty;
+        self.s.w.phonetic.set_visible(show);
+        self.s.w.phonetic_more.set_visible(false);
+        // the row may come back at a new width: force a fresh measurement
+        self.s.phonetic_width.set(0);
+    }
+
+    fn on_phonetic_more(&self) {
+        let label = &self.s.w.phonetic;
+        let clamped = label.lines() == 3;
+        label.set_lines(if clamped { 0 } else { 3 });
+        self.s.w.phonetic_more.set_label(if clamped { "Less" } else { "More" });
     }
 
     fn on_lock_toggled(&self, btn: &gtk4::ToggleButton) {
@@ -879,6 +938,7 @@ impl MainWindow {
         self.sync_source_buttons();
         self.sync_result_buttons();
         self.rebuild_llm();
+        self.sync_phonetic();
     }
 
     pub(crate) fn sync_status_bar(&self) {
@@ -1075,6 +1135,7 @@ impl MainWindow {
                         move || {
                             this.sync_status_bar();
                             this.sync_popup_input();
+                            this.sync_phonetic();
                         }
                     }) as Rc<dyn Fn()>,
                 );
@@ -1084,6 +1145,49 @@ impl MainWindow {
         if let Some(app) = self.win.application() {
             app.set_accels_for_action("win.translate", &["<Control>Return"]);
         }
+
+        // pronunciation toggle: flips config + menu state, row follows
+        let phonetic_action = self.s.phonetic_action.clone();
+        {
+            let this = self.clone();
+            phonetic_action.connect_activate(move |action, _| {
+                let active = action.state().and_then(|s| s.get::<bool>()).unwrap_or(false);
+                action.change_state(&(!active).to_variant());
+                this.s.config.borrow_mut().show_phonetic = !active;
+                this.s.config.borrow().save();
+                this.sync_phonetic();
+            });
+        }
+        self.win.add_action(&phonetic_action);
+
+        let this = self.clone();
+        self.s.w.phonetic_more.connect_clicked(move |_| this.on_phonetic_more());
+
+        // show More only when the text really outgrows the 3-line clamp:
+        // compare the unclamped height with the clamped one at the same width.
+        // Runs per frame but early-outs until the width or the text changes.
+        let s = self.s.clone();
+        self.s.w.phonetic.add_tick_callback(move |label, _| {
+            if !label.is_visible() {
+                return glib::ControlFlow::Continue;
+            }
+            let width = label.width();
+            if width <= 0 || width == s.phonetic_width.get() {
+                return glib::ControlFlow::Continue;
+            }
+            s.phonetic_width.set(width);
+            // measure unclamped, then at the 3-line clamp, then restore the
+            // clamp state the user chose (measure is side-effect free; the
+            // two property writes coalesce before any relayout)
+            let expanded = label.lines() != 3;
+            label.set_lines(0);
+            let (_, full, _, _) = label.measure(gtk4::Orientation::Vertical, width);
+            label.set_lines(3);
+            let (_, clamped, _, _) = label.measure(gtk4::Orientation::Vertical, width);
+            label.set_lines(if expanded { 0 } else { 3 });
+            s.w.phonetic_more.set_visible(full > clamped);
+            glib::ControlFlow::Continue
+        });
 
         let key_ctl = gtk4::EventControllerKey::new();
         {
@@ -1289,6 +1393,7 @@ fn build_ui() -> (W, gtk4::Box) {
     let menu_btn = gtk4::MenuButton::new();
     menu_btn.set_icon_name("open-menu-symbolic");
     let menu = gio::Menu::new();
+    menu.append(Some("Show Pronunciation"), Some("win.phonetic"));
     menu.append(Some("Preferences"), Some("win.preferences"));
     menu.append(Some("Quit"), Some("app.quit"));
     let settings_pop = gtk4::PopoverMenu::from_model(Some(&menu));
@@ -1343,8 +1448,33 @@ fn build_ui() -> (W, gtk4::Box) {
         });
     }
 
+    let phonetic = gtk4::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .lines(3)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .selectable(true)
+        .hexpand(true)
+        .visible(false)
+        .build();
+    phonetic.add_css_class("dim-label");
+    let phonetic_more = gtk4::Button::with_label("More");
+    phonetic_more.add_css_class("flat");
+    phonetic_more.set_valign(gtk4::Align::Start);
+    phonetic_more.set_visible(false);
+    // 12 aligns with the text inside the source view, same as its own margin
+    let phonetic_row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    phonetic_row.append(&phonetic);
+    phonetic_row.append(&phonetic_more);
+
     let src_col = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     src_col.append(&scroll_src);
+    src_col.append(&phonetic_row);
     src_col.append(&row_text);
     let frame_src = gtk4::Frame::builder().child(&src_col).build();
     frame_src.set_hexpand(true);
@@ -1390,6 +1520,8 @@ fn build_ui() -> (W, gtk4::Box) {
         scroll_src,
         scroll_res,
         frame_src,
+        phonetic,
+        phonetic_more,
         row_text,
         cards,
         header,
